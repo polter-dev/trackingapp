@@ -121,6 +121,33 @@ def summarize_returns(returns: pd.DataFrame) -> pd.DataFrame:
     return summary.set_index("Ticker")
 
 
+def compute_latest_metrics(price_df: pd.DataFrame) -> pd.DataFrame:
+    """Return latest price, daily change, and month-to-date change per ticker."""
+
+    if price_df.empty:
+        return pd.DataFrame(columns=["Ticker", "Last", "Daily Change", "MTD Change"])
+
+    filled = price_df.ffill()
+    latest = filled.iloc[-1]
+    previous = filled.iloc[-2] if len(filled) > 1 else filled.iloc[-1]
+
+    month_start = filled.index[-1].replace(day=1)
+    month_window = filled[filled.index >= month_start]
+    month_start_values = month_window.iloc[0] if not month_window.empty else latest
+
+    metrics = pd.DataFrame(
+        {
+            "Ticker": latest.index,
+            "Last": latest.values,
+            "Daily Change": (latest - previous) / previous.replace(0, np.nan),
+            "MTD Change": (latest - month_start_values)
+            / month_start_values.replace(0, np.nan),
+        }
+    )
+
+    return metrics.set_index("Ticker")
+
+
 def describe_price_trend(series: pd.Series, lookback_days: int = 90) -> str:
     """Generate a human-readable description of a price series."""
     clean = series.dropna()
@@ -379,9 +406,20 @@ def render_dashboard() -> None:
             default=list(MACRO_SERIES.keys()),
         )
 
-        if st.button("Refresh market & macro data"):
-            st.cache_data.clear()
-            st.experimental_rerun()
+        refresh_clicked = st.button(
+            "Refresh market & macro data",
+            type="primary",
+            help="Force a new download of prices and macro data, bypassing the hourly cache.",
+        )
+
+        if refresh_clicked:
+            load_equity_prices.clear()
+            load_macro_series.clear()
+            st.session_state["last_manual_refresh"] = pd.Timestamp.utcnow()
+            if hasattr(st, "rerun"):
+                st.rerun()
+            else:
+                st.experimental_rerun()
 
     all_tickers = list(dict.fromkeys([*selected_tickers, *custom_tickers]))
 
@@ -400,85 +438,143 @@ def render_dashboard() -> None:
         st.warning("No data retrieved for the selected tickers and date range.")
         return
 
-    st.subheader("Adjusted Close Prices")
     last_available = price_df.dropna(how="all").index.max()
+    last_refresh_caption = "Prices refresh through the latest available trading session."
     if last_available:
-        st.caption(
+        last_refresh_caption = (
             "Prices refresh through the latest available trading session "
-            f"(last close: {last_available.date()}). Cached data auto-refreshes every "
-            f"{CACHE_TTL_SECONDS // 60} minutes or whenever you press the refresh button in the sidebar."
+            f"(last close: {last_available.date()})."
         )
-    else:
-        st.caption(
-            "Prices refresh through the latest available trading session. Use the sidebar to update the date range."
-        )
-    plot_price_history(price_df)
 
-    highlights = summarize_market_snapshot(price_df)
-    if highlights:
-        st.markdown("#### Session Highlights")
-        for bullet in highlights:
-            st.markdown(f"- {bullet}")
+    if "last_manual_refresh" in st.session_state:
+        manual_ts = st.session_state["last_manual_refresh"]
+        if isinstance(manual_ts, pd.Timestamp):
+            manual_ts = (
+                manual_ts.tz_localize("UTC")
+                if manual_ts.tzinfo is None
+                else manual_ts.tz_convert("UTC")
+            )
+        else:
+            manual_ts = pd.Timestamp(manual_ts, tz="UTC")
+        last_refresh_caption += (
+            f" Manual refresh triggered at {manual_ts.strftime('%Y-%m-%d %H:%M UTC')}.")
 
-    st.markdown("#### Recent Price Trend Summaries")
-    for ticker in all_tickers:
-        if ticker not in price_df.columns:
-            st.write(f"{ticker}: No price data available for the selected period.")
-            continue
-        st.write(describe_price_trend(price_df[ticker]))
+    st.caption(
+        last_refresh_caption
+        + " Cached data auto-refreshes every "
+        + f"{CACHE_TTL_SECONDS // 60} minutes or whenever you press the refresh button in the sidebar."
+    )
+
+    metrics = compute_latest_metrics(price_df)
+    if not metrics.empty:
+        st.markdown("### Snapshot")
+        cols = st.columns(min(4, len(metrics)))
+        for idx, (ticker, row) in enumerate(metrics.iterrows()):
+            column = cols[idx % len(cols)]
+            with column:
+                daily = "N/A"
+                if pd.notna(row["Daily Change"]):
+                    daily = f"{row['Daily Change']:+.2%}"
+                mtd = "N/A"
+                if pd.notna(row["MTD Change"]):
+                    mtd = f"{row['MTD Change']:+.2%}"
+                st.metric(
+                    label=ticker,
+                    value=f"{row['Last']:,.2f}",
+                    delta=f"{daily} vs. prior close",
+                    help=f"Month-to-date: {mtd}",
+                )
+
+    price_tab, returns_tab, forecast_tab, macro_tab = st.tabs(
+        [
+            "Price Trends",
+            "Return Profile",
+            "Forecasts",
+            "Macro View",
+        ]
+    )
+
+    with price_tab:
+        st.subheader("Adjusted Close Prices")
+        plot_price_history(price_df)
+
+        highlights = summarize_market_snapshot(price_df)
+        if highlights:
+            st.markdown("#### Session Highlights")
+            for bullet in highlights:
+                st.markdown(f"- {bullet}")
+
+        st.markdown("#### Recent Price Trend Summaries")
+        for ticker in all_tickers:
+            if ticker not in price_df.columns:
+                st.write(f"{ticker}: No price data available for the selected period.")
+                continue
+            st.write(describe_price_trend(price_df[ticker]))
 
     returns = price_df.pct_change().dropna(how="all")
 
-    st.subheader("Daily Returns")
-    plot_returns(returns)
+    with returns_tab:
+        st.subheader("Daily Returns")
+        plot_returns(returns)
 
-    summary = summarize_returns(returns)
-    if not summary.empty:
-        st.subheader("Annualized Performance Summary")
-        styled = summary.style.format({
-            "Average Return": "{:+.2%}",
-            "Volatility": "{:.2%}",
-            "Cumulative Return": "{:+.2%}",
-        })
-        st.dataframe(styled, use_container_width=True)
+        summary = summarize_returns(returns)
+        if not summary.empty:
+            st.subheader("Annualized Performance Summary")
+            styled = summary.style.format(
+                {
+                    "Average Return": "{:+.2%}",
+                    "Volatility": "{:.2%}",
+                    "Cumulative Return": "{:+.2%}",
+                }
+            )
+            st.dataframe(styled, use_container_width=True)
 
-    st.subheader("Price Forecasts")
-    st.caption("ARIMA-based projections illustrate a plausible range for the next trading days.")
-    for ticker in all_tickers:
-        if ticker not in price_df.columns:
-            continue
-        series = price_df[ticker]
-        forecast_result = forecast_prices(series, steps=forecast_horizon)
-        if forecast_result:
-            plot_forecast(ticker, series, forecast_result)
-            latest_price = series.dropna().iloc[-1]
-            projected = forecast_result.forecast.iloc[-1]
-            delta = projected / latest_price - 1 if latest_price else np.nan
-            delta_text = f"{delta:+.2%}" if np.isfinite(delta) else "an unclear"
-            st.info(
-                f"Projected {forecast_horizon}-day price for {ticker}: {projected:,.2f} "
-                f"(vs. latest close {latest_price:,.2f}, change {delta_text})."
+    with forecast_tab:
+        st.subheader("Price Forecasts")
+        st.caption(
+            "ARIMA-based projections illustrate a plausible range for the next trading days."
+        )
+        for ticker in all_tickers:
+            if ticker not in price_df.columns:
+                continue
+            series = price_df[ticker]
+            forecast_result = forecast_prices(series, steps=forecast_horizon)
+            if forecast_result:
+                plot_forecast(ticker, series, forecast_result)
+                latest_price = series.dropna().iloc[-1]
+                projected = forecast_result.forecast.iloc[-1]
+                delta = projected / latest_price - 1 if latest_price else np.nan
+                delta_text = f"{delta:+.2%}" if np.isfinite(delta) else "an unclear"
+                st.info(
+                    f"Projected {forecast_horizon}-day price for {ticker}: {projected:,.2f} "
+                    f"(vs. latest close {latest_price:,.2f}, change {delta_text})."
+                )
+            else:
+                st.info(f"Not enough data to forecast {ticker} or model did not converge.")
+
+    with macro_tab:
+        st.subheader("Macroeconomic Context")
+        macro_data: Dict[str, pd.Series] = {}
+        for name in selected_macro:
+            symbol = MACRO_SERIES[name]
+            series = load_macro_series(symbol, start_date, end_date)
+            macro_data[name] = series
+            with st.expander(name, expanded=False):
+                plot_macro_series(name, series)
+                st.caption(describe_macro_trend(name, series))
+
+        monthly_returns = to_monthly_returns(price_df)
+        correlation_table = compute_macro_correlations(monthly_returns, macro_data)
+        if not correlation_table.empty:
+            st.markdown("#### Correlation with Macro Indicators")
+            st.dataframe(
+                correlation_table.style.format({"Correlation": "{:+.2f}"}),
+                use_container_width=True,
             )
         else:
-            st.info(f"Not enough data to forecast {ticker} or model did not converge.")
-
-    st.subheader("Macroeconomic Context")
-    macro_data: Dict[str, pd.Series] = {}
-    for name in selected_macro:
-        symbol = MACRO_SERIES[name]
-        series = load_macro_series(symbol, start_date, end_date)
-        macro_data[name] = series
-        with st.expander(name, expanded=False):
-            plot_macro_series(name, series)
-            st.caption(describe_macro_trend(name, series))
-
-    monthly_returns = to_monthly_returns(price_df)
-    correlation_table = compute_macro_correlations(monthly_returns, macro_data)
-    if not correlation_table.empty:
-        st.markdown("#### Correlation with Macro Indicators")
-        st.dataframe(correlation_table.style.format({"Correlation": "{:+.2f}"}), use_container_width=True)
-    else:
-        st.info("Insufficient overlapping data to compute correlations with macro indicators.")
+            st.info(
+                "Insufficient overlapping data to compute correlations with macro indicators."
+            )
 
 
 if __name__ == "__main__":
