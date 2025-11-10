@@ -1,0 +1,332 @@
+"""Streamlit dashboard for tracking equities and macroeconomic indicators."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, timedelta
+from typing import Dict, Iterable, List, Optional
+
+import altair as alt
+import numpy as np
+import pandas as pd
+import streamlit as st
+from pandas_datareader import data as pdr
+
+try:
+    import yfinance as yf
+    HAS_YFINANCE = True
+    try:
+        from yfinance import pdr_override as _yf_pdr_override
+    except (ImportError, AttributeError):
+        _yf_pdr_override = getattr(yf, "pdr_override", None)
+except ModuleNotFoundError:
+    yf = None
+    _yf_pdr_override = None
+    HAS_YFINANCE = False
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tools.sm_exceptions import ValueWarning
+import warnings
+
+# Silence warnings from statsmodels when fitting simple ARIMA models
+warnings.simplefilter("ignore", ValueWarning)
+
+DEFAULT_TICKERS: List[str] = ["AAPL", "MSFT", "GOOGL", "AMZN", "SPY", "QQQ", "VOO"]
+MACRO_SERIES: Dict[str, str] = {
+    "Personal Savings Rate": "PSAVERT",
+    "Unemployment Rate": "UNRATE",
+    "Federal Funds Rate": "FEDFUNDS",
+    "Consumer Price Index (CPI)": "CPIAUCSL",
+}
+
+
+@st.cache_data(show_spinner=False)
+def load_equity_prices(tickers: Iterable[str], start: date, end: date) -> pd.DataFrame:
+    """Download adjusted close prices for the requested tickers."""
+    tickers = list(dict.fromkeys(tickers))  # drop duplicates while preserving order
+    if not tickers:
+        return pd.DataFrame()
+
+    if HAS_YFINANCE:
+        raw = yf.download(
+            tickers,
+            start=start,
+            end=end + timedelta(days=1),  # include end date
+            auto_adjust=False,
+            progress=False,
+            group_by="ticker",
+        )
+
+        if len(tickers) == 1:
+            data = raw[["Adj Close"]].rename(columns={"Adj Close": tickers[0]})
+        else:
+            data = raw.xs("Adj Close", axis=1, level=1)
+    else:
+        frames = []
+        for ticker in tickers:
+            try:
+                # Stooq returns data in reverse chronological order
+                stooq = pdr.DataReader(ticker, "stooq", start, end + timedelta(days=1)).sort_index()
+            except Exception as exc:
+                st.warning(f"Unable to load {ticker} from Stooq: {exc}")
+                continue
+            frames.append(stooq[["Close"]].rename(columns={"Close": ticker}))
+
+        if not frames:
+            return pd.DataFrame()
+
+        data = pd.concat(frames, axis=1).sort_index()
+
+    data.index.name = "Date"
+    return data.dropna(how="all")
+
+
+@st.cache_data(show_spinner=False)
+def load_macro_series(symbol: str, start: date, end: date) -> pd.Series:
+    """Fetch a macroeconomic time series from FRED."""
+    try:
+        series = pdr.DataReader(symbol, "fred", start, end)
+    except Exception as exc:
+        st.warning(f"Unable to load {symbol} from FRED: {exc}")
+        return pd.Series(dtype=float)
+
+    return series[symbol].rename(symbol)
+
+
+def to_monthly_returns(price_df: pd.DataFrame) -> pd.DataFrame:
+    """Convert daily prices to monthly percentage returns."""
+    if price_df.empty:
+        return price_df
+
+    monthly_prices = price_df.resample("M").last()
+    monthly_returns = monthly_prices.pct_change().dropna(how="all")
+    return monthly_returns
+
+
+def summarize_returns(returns: pd.DataFrame) -> pd.DataFrame:
+    """Compute average return, volatility, and cumulative return per ticker."""
+    if returns.empty:
+        return pd.DataFrame(columns=["Ticker", "Average Return", "Volatility", "Cumulative Return"])
+
+    cumulative = (1 + returns).cumprod().iloc[-1] - 1
+    summary = pd.DataFrame(
+        {
+            "Ticker": returns.columns,
+            "Average Return": (returns.mean() * 252).values,
+            "Volatility": (returns.std() * np.sqrt(252)).values,
+            "Cumulative Return": cumulative.values,
+        }
+    )
+    return summary.set_index("Ticker")
+
+
+@dataclass
+class ForecastResult:
+    forecast: pd.Series
+    lower: pd.Series
+    upper: pd.Series
+
+
+@st.cache_data(show_spinner=False)
+def forecast_prices(series: pd.Series, steps: int = 30) -> Optional[ForecastResult]:
+    """Use an ARIMA(1,1,1) model to forecast future prices."""
+    clean_series = series.dropna()
+    if clean_series.empty or len(clean_series) < 40:
+        return None
+
+    try:
+        model = ARIMA(clean_series, order=(1, 1, 1))
+        model_fit = model.fit()
+        forecast_result = model_fit.get_forecast(steps=steps)
+        forecast_index = pd.date_range(clean_series.index[-1] + timedelta(days=1), periods=steps, freq="B")
+        forecast = pd.Series(forecast_result.predicted_mean.values, index=forecast_index, name="Forecast")
+        conf_int = forecast_result.conf_int(alpha=0.2)
+        lower = pd.Series(conf_int.iloc[:, 0].values, index=forecast_index, name="Lower")
+        upper = pd.Series(conf_int.iloc[:, 1].values, index=forecast_index, name="Upper")
+        return ForecastResult(forecast=forecast, lower=lower, upper=upper)
+    except Exception as exc:
+        st.warning(f"Unable to build forecast for {series.name}: {exc}")
+        return None
+
+
+def plot_price_history(price_df: pd.DataFrame) -> None:
+    if price_df.empty:
+        st.info("No price data to display.")
+        return
+
+    chart_data = price_df.reset_index().melt("Date", var_name="Ticker", value_name="Price")
+    chart = (
+        alt.Chart(chart_data)
+        .mark_line()
+        .encode(x="Date:T", y="Price:Q", color="Ticker:N")
+        .properties(height=400)
+        .interactive()
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
+def plot_returns(returns: pd.DataFrame) -> None:
+    if returns.empty:
+        st.info("No returns data to display.")
+        return
+
+    chart_data = returns.reset_index().melt("Date", var_name="Ticker", value_name="Return")
+    chart = (
+        alt.Chart(chart_data)
+        .mark_bar()
+        .encode(x="Date:T", y="Return:Q", color="Ticker:N")
+        .properties(height=300)
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
+def plot_forecast(ticker: str, series: pd.Series, forecast: ForecastResult) -> None:
+    history_df = series.dropna().reset_index()
+    history_df.columns = ["Date", "Price"]
+
+    forecast_df = pd.DataFrame(
+        {
+            "Date": forecast.forecast.index,
+            "Price": forecast.forecast.values,
+            "Lower": forecast.lower.values,
+            "Upper": forecast.upper.values,
+        }
+    )
+
+    base = alt.Chart(history_df).mark_line(color="#1f77b4").encode(x="Date:T", y="Price:Q")
+    future_line = alt.Chart(forecast_df).mark_line(color="#ff7f0e").encode(x="Date:T", y="Price:Q")
+    band = (
+        alt.Chart(forecast_df)
+        .mark_area(opacity=0.2)
+        .encode(x="Date:T", y="Lower:Q", y2="Upper:Q")
+    )
+
+    st.altair_chart((base + band + future_line).properties(title=f"{ticker} Price Forecast"), use_container_width=True)
+
+
+def plot_macro_series(series_name: str, series: pd.Series) -> None:
+    if series.empty:
+        st.info(f"No data available for {series_name}.")
+        return
+
+    df = series.reset_index()
+    df.columns = ["Date", series_name]
+    chart = (
+        alt.Chart(df)
+        .mark_line(color="#2ca02c")
+        .encode(x="Date:T", y=f"{series_name}:Q")
+        .properties(title=series_name, height=300)
+        .interactive()
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
+def compute_macro_correlations(
+    monthly_returns: pd.DataFrame, macro_data: Dict[str, pd.Series]
+) -> pd.DataFrame:
+    results = []
+    for name, series in macro_data.items():
+        if series.empty:
+            continue
+        macro_changes = series.resample("M").last().pct_change().dropna()
+        aligned = monthly_returns.join(macro_changes.rename("Macro"), how="inner")
+        if aligned.empty:
+            continue
+        correlations = aligned.corr()["Macro"].drop("Macro")
+        for ticker, value in correlations.items():
+            results.append({"Macro Indicator": name, "Ticker": ticker, "Correlation": value})
+
+    if not results:
+        return pd.DataFrame(columns=["Macro Indicator", "Ticker", "Correlation"])
+
+    return pd.DataFrame(results).sort_values(by="Correlation", ascending=False)
+
+
+def render_dashboard() -> None:
+    st.set_page_config(page_title="Market & Macro Tracker", layout="wide")
+    st.title("Market & Macro Tracker")
+    st.caption(
+        "Interactive dashboard that monitors equities, creates time-series forecasts, "
+        "and relates performance to macroeconomic trends."
+    )
+
+    if not HAS_YFINANCE:
+        st.info(
+            "`yfinance` is not installed. Using Stooq prices via pandas-datareader instead. "
+            "Install `yfinance` for broader ticker coverage."
+        )
+
+    with st.sidebar:
+        st.header("Configuration")
+        selected_tickers = st.multiselect(
+            "Select tickers (stocks / ETFs)",
+            options=DEFAULT_TICKERS,
+            default=DEFAULT_TICKERS[:4],
+        )
+
+        today = date.today()
+        default_start = today - timedelta(days=5 * 365)
+        start_date = st.date_input("Start date", value=default_start, max_value=today - timedelta(days=7))
+        end_date = st.date_input("End date", value=today, max_value=today)
+        forecast_horizon = st.slider("Forecast horizon (trading days)", min_value=5, max_value=90, value=30)
+        selected_macro = st.multiselect("Macroeconomic indicators", list(MACRO_SERIES.keys()), default=list(MACRO_SERIES.keys()))
+
+    if start_date >= end_date:
+        st.error("Start date must be earlier than end date.")
+        return
+
+    with st.spinner("Downloading price data..."):
+        price_df = load_equity_prices(selected_tickers, start_date, end_date)
+
+    if price_df.empty:
+        st.warning("No data retrieved for the selected tickers and date range.")
+        return
+
+    st.subheader("Adjusted Close Prices")
+    plot_price_history(price_df)
+
+    returns = price_df.pct_change().dropna(how="all")
+
+    st.subheader("Daily Returns")
+    plot_returns(returns)
+
+    summary = summarize_returns(returns)
+    if not summary.empty:
+        st.subheader("Annualized Performance Summary")
+        styled = summary.style.format({
+            "Average Return": "{:+.2%}",
+            "Volatility": "{:.2%}",
+            "Cumulative Return": "{:+.2%}",
+        })
+        st.dataframe(styled, use_container_width=True)
+
+    st.subheader("Price Forecasts")
+    for ticker in selected_tickers:
+        series = price_df[ticker]
+        forecast_result = forecast_prices(series, steps=forecast_horizon)
+        if forecast_result:
+            plot_forecast(ticker, series, forecast_result)
+        else:
+            st.info(f"Not enough data to forecast {ticker} or model did not converge.")
+
+    st.subheader("Macroeconomic Context")
+    macro_data: Dict[str, pd.Series] = {}
+    for name in selected_macro:
+        symbol = MACRO_SERIES[name]
+        series = load_macro_series(symbol, start_date, end_date)
+        macro_data[name] = series
+        with st.expander(name, expanded=False):
+            plot_macro_series(name, series)
+
+    monthly_returns = to_monthly_returns(price_df)
+    correlation_table = compute_macro_correlations(monthly_returns, macro_data)
+    if not correlation_table.empty:
+        st.markdown("#### Correlation with Macro Indicators")
+        st.dataframe(correlation_table.style.format({"Correlation": "{:+.2f}"}), use_container_width=True)
+    else:
+        st.info("Insufficient overlapping data to compute correlations with macro indicators.")
+
+
+if __name__ == "__main__":
+    if HAS_YFINANCE and callable(_yf_pdr_override):
+        _yf_pdr_override()
+    render_dashboard()
