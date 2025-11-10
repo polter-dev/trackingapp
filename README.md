@@ -4,8 +4,9 @@ This Streamlit app tracks equities and ETFs using freely available market data a
 
 ## Features
 - Download historical adjusted close prices for selected stocks and ETFs using `yfinance`.
-- Visualize price histories, daily returns, and annualized performance metrics.
+- Visualize price histories, daily returns, and annualized performance metrics alongside plain-language trend summaries.
 - Generate ARIMA (1,1,1) forecasts for future prices with confidence intervals.
+- Include the S&P 500 index (^GSPC) as a default market benchmark.
 - Retrieve macroeconomic indicators (personal savings rate, unemployment rate, federal funds rate, CPI) from FRED via `pandas-datareader`.
 - Explore correlations between monthly asset returns and macroeconomic changes.
 
@@ -26,4 +27,4 @@ This Streamlit app tracks equities and ETFs using freely available market data a
 ## Notes
 - Some macroeconomic series are released monthly; ensure the selected date range includes sufficient overlap with the equity data to compute correlations.
 - Forecasts are generated using a simple ARIMA model and should be interpreted as illustrative projections rather than investment advice.
-requirements.txt
+- If `yfinance` is unavailable, the app automatically falls back to Stooq prices via `pandas-datareader`; installing `yfinance` is recommended for broader ticker coverage.

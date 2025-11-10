@@ -30,7 +30,7 @@ import warnings
 # Silence warnings from statsmodels when fitting simple ARIMA models
 warnings.simplefilter("ignore", ValueWarning)
 
-DEFAULT_TICKERS: List[str] = ["AAPL", "MSFT", "GOOGL", "AMZN", "SPY", "QQQ", "VOO"]
+DEFAULT_TICKERS: List[str] = ["AAPL", "MSFT", "GOOGL", "AMZN", "SPY", "QQQ", "VOO", "^GSPC"]
 MACRO_SERIES: Dict[str, str] = {
     "Personal Savings Rate": "PSAVERT",
     "Unemployment Rate": "UNRATE",
@@ -117,6 +117,57 @@ def summarize_returns(returns: pd.DataFrame) -> pd.DataFrame:
         }
     )
     return summary.set_index("Ticker")
+
+
+def describe_price_trend(series: pd.Series, lookback_days: int = 90) -> str:
+    """Generate a human-readable description of a price series."""
+    clean = series.dropna()
+    if clean.empty:
+        return f"{series.name}: Not enough data to describe the recent trend."
+
+    latest_date = clean.index[-1]
+    window_start = latest_date - timedelta(days=lookback_days)
+    window = clean[clean.index >= window_start]
+    if len(window) < 2:
+        window = clean.tail(min(lookback_days, len(clean)))
+    if len(window) < 2:
+        return f"{series.name}: Not enough observations for a recent trend summary."
+
+    days = (window.index[-1] - window.index[0]).days or 1
+    change = window.iloc[-1] / window.iloc[0] - 1
+    slope = np.polyfit(np.arange(len(window)), window.values, 1)[0]
+    direction = "has been rising" if slope > 0 else "has been drifting lower"
+    if abs(slope) < 1e-6:
+        direction = "has been relatively flat"
+
+    change_text = f"{change:+.2%}" if np.isfinite(change) else "an unclear"
+    return (
+        f"{series.name}: {direction} over the past {days} days with a {change_text} move. "
+        f"Most recent close: {window.iloc[-1]:,.2f}."
+    )
+
+
+def describe_macro_trend(series_name: str, series: pd.Series) -> str:
+    """Generate a human-readable description of a macro series."""
+    clean = series.dropna()
+    if clean.empty:
+        return f"{series_name}: No recent data available."
+
+    recent = clean.last("365D")
+    if len(recent) < 2:
+        recent = clean.tail(min(6, len(clean)))
+    if len(recent) < 2:
+        return f"{series_name}: Not enough observations for a recent trend summary."
+
+    change = recent.iloc[-1] - recent.iloc[0]
+    pct_change = recent.iloc[-1] / recent.iloc[0] - 1 if recent.iloc[0] != 0 else np.nan
+    trend = "increased" if change > 0 else "decreased"
+    if abs(change) < 1e-9:
+        trend = "remained broadly unchanged"
+    pct_text = f" ({pct_change:+.2%})" if np.isfinite(pct_change) else ""
+    return (
+        f"{series_name}: {trend} over the last {len(recent)} observations to {recent.iloc[-1]:,.2f}{pct_text}."
+    )
 
 
 @dataclass
@@ -282,7 +333,17 @@ def render_dashboard() -> None:
         return
 
     st.subheader("Adjusted Close Prices")
+    st.caption(
+        "Prices refresh through the latest available trading session. Use the sidebar to update the date range."
+    )
     plot_price_history(price_df)
+
+    st.markdown("#### Recent Price Trend Summaries")
+    for ticker in selected_tickers:
+        if ticker not in price_df.columns:
+            st.write(f"{ticker}: No price data available for the selected period.")
+            continue
+        st.write(describe_price_trend(price_df[ticker]))
 
     returns = price_df.pct_change().dropna(how="all")
 
@@ -300,11 +361,22 @@ def render_dashboard() -> None:
         st.dataframe(styled, use_container_width=True)
 
     st.subheader("Price Forecasts")
+    st.caption("ARIMA-based projections illustrate a plausible range for the next trading days.")
     for ticker in selected_tickers:
+        if ticker not in price_df.columns:
+            continue
         series = price_df[ticker]
         forecast_result = forecast_prices(series, steps=forecast_horizon)
         if forecast_result:
             plot_forecast(ticker, series, forecast_result)
+            latest_price = series.dropna().iloc[-1]
+            projected = forecast_result.forecast.iloc[-1]
+            delta = projected / latest_price - 1 if latest_price else np.nan
+            delta_text = f"{delta:+.2%}" if np.isfinite(delta) else "an unclear"
+            st.info(
+                f"Projected {forecast_horizon}-day price for {ticker}: {projected:,.2f} "
+                f"(vs. latest close {latest_price:,.2f}, change {delta_text})."
+            )
         else:
             st.info(f"Not enough data to forecast {ticker} or model did not converge.")
 
@@ -316,6 +388,7 @@ def render_dashboard() -> None:
         macro_data[name] = series
         with st.expander(name, expanded=False):
             plot_macro_series(name, series)
+            st.caption(describe_macro_trend(name, series))
 
     monthly_returns = to_monthly_returns(price_df)
     correlation_table = compute_macro_correlations(monthly_returns, macro_data)
