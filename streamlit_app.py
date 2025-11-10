@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Dict, Iterable, List, Optional
@@ -31,6 +32,7 @@ import warnings
 warnings.simplefilter("ignore", ValueWarning)
 
 DEFAULT_TICKERS: List[str] = ["AAPL", "MSFT", "GOOGL", "AMZN", "SPY", "QQQ", "VOO", "^GSPC"]
+CACHE_TTL_SECONDS = 60 * 60  # refresh cached data every hour
 MACRO_SERIES: Dict[str, str] = {
     "Personal Savings Rate": "PSAVERT",
     "Unemployment Rate": "UNRATE",
@@ -39,7 +41,7 @@ MACRO_SERIES: Dict[str, str] = {
 }
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
 def load_equity_prices(tickers: Iterable[str], start: date, end: date) -> pd.DataFrame:
     """Download adjusted close prices for the requested tickers."""
     tickers = list(dict.fromkeys(tickers))  # drop duplicates while preserving order
@@ -80,7 +82,7 @@ def load_equity_prices(tickers: Iterable[str], start: date, end: date) -> pd.Dat
     return data.dropna(how="all")
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
 def load_macro_series(symbol: str, start: date, end: date) -> pd.Series:
     """Fetch a macroeconomic time series from FRED."""
     try:
@@ -177,7 +179,7 @@ class ForecastResult:
     upper: pd.Series
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
 def forecast_prices(series: pd.Series, steps: int = 30) -> Optional[ForecastResult]:
     """Use an ARIMA(1,1,1) model to forecast future prices."""
     clean_series = series.dropna()
@@ -292,6 +294,51 @@ def compute_macro_correlations(
     return pd.DataFrame(results).sort_values(by="Correlation", ascending=False)
 
 
+def parse_custom_tickers(raw_text: str) -> List[str]:
+    """Normalize custom ticker text input into uppercase symbols."""
+    if not raw_text:
+        return []
+
+    parts = re.split(r"[\s,;]+", raw_text)
+    cleaned: List[str] = []
+    for token in parts:
+        symbol = token.strip().upper()
+        if symbol and symbol not in cleaned:
+            cleaned.append(symbol)
+    return cleaned
+
+
+def summarize_market_snapshot(price_df: pd.DataFrame) -> List[str]:
+    """Produce a small set of highlights for the latest trading session."""
+    clean = price_df.dropna(how="all")
+    if len(clean) < 2:
+        return []
+
+    latest = clean.iloc[-1]
+    previous = clean.iloc[-2]
+    daily_returns = (latest / previous - 1).replace([np.inf, -np.inf], np.nan).dropna()
+    if daily_returns.empty:
+        return []
+
+    highlights: List[str] = []
+    top_gainer = daily_returns.idxmax()
+    top_loser = daily_returns.idxmin()
+    highlights.append(
+        f"Top gainer: {top_gainer} {daily_returns[top_gainer]:+.2%} since the prior close."
+    )
+    if top_loser != top_gainer:
+        highlights.append(
+            f"Biggest pullback: {top_loser} {daily_returns[top_loser]:+.2%} over the same window."
+        )
+
+    broad_move = daily_returns.mean()
+    highlights.append(
+        "Average move across tracked assets: "
+        f"{broad_move:+.2%} (simple average of daily percentage changes)."
+    )
+    return highlights
+
+
 def render_dashboard() -> None:
     st.set_page_config(page_title="Market & Macro Tracker", layout="wide")
     st.title("Market & Macro Tracker")
@@ -314,32 +361,67 @@ def render_dashboard() -> None:
             default=DEFAULT_TICKERS[:4],
         )
 
+        custom_ticker_text = st.text_input(
+            "Add custom tickers",
+            placeholder="e.g. NVDA, TSLA",
+            help="Enter comma or space separated ticker symbols to augment the default list.",
+        )
+        custom_tickers = parse_custom_tickers(custom_ticker_text)
+
         today = date.today()
         default_start = today - timedelta(days=5 * 365)
         start_date = st.date_input("Start date", value=default_start, max_value=today - timedelta(days=7))
         end_date = st.date_input("End date", value=today, max_value=today)
         forecast_horizon = st.slider("Forecast horizon (trading days)", min_value=5, max_value=90, value=30)
-        selected_macro = st.multiselect("Macroeconomic indicators", list(MACRO_SERIES.keys()), default=list(MACRO_SERIES.keys()))
+        selected_macro = st.multiselect(
+            "Macroeconomic indicators",
+            list(MACRO_SERIES.keys()),
+            default=list(MACRO_SERIES.keys()),
+        )
+
+        if st.button("Refresh market & macro data"):
+            st.cache_data.clear()
+            st.experimental_rerun()
+
+    all_tickers = list(dict.fromkeys([*selected_tickers, *custom_tickers]))
 
     if start_date >= end_date:
         st.error("Start date must be earlier than end date.")
         return
 
+    if not all_tickers:
+        st.warning("Select at least one ticker to visualize market data.")
+        return
+
     with st.spinner("Downloading price data..."):
-        price_df = load_equity_prices(selected_tickers, start_date, end_date)
+        price_df = load_equity_prices(all_tickers, start_date, end_date)
 
     if price_df.empty:
         st.warning("No data retrieved for the selected tickers and date range.")
         return
 
     st.subheader("Adjusted Close Prices")
-    st.caption(
-        "Prices refresh through the latest available trading session. Use the sidebar to update the date range."
-    )
+    last_available = price_df.dropna(how="all").index.max()
+    if last_available:
+        st.caption(
+            "Prices refresh through the latest available trading session "
+            f"(last close: {last_available.date()}). Cached data auto-refreshes every "
+            f"{CACHE_TTL_SECONDS // 60} minutes or whenever you press the refresh button in the sidebar."
+        )
+    else:
+        st.caption(
+            "Prices refresh through the latest available trading session. Use the sidebar to update the date range."
+        )
     plot_price_history(price_df)
 
+    highlights = summarize_market_snapshot(price_df)
+    if highlights:
+        st.markdown("#### Session Highlights")
+        for bullet in highlights:
+            st.markdown(f"- {bullet}")
+
     st.markdown("#### Recent Price Trend Summaries")
-    for ticker in selected_tickers:
+    for ticker in all_tickers:
         if ticker not in price_df.columns:
             st.write(f"{ticker}: No price data available for the selected period.")
             continue
@@ -362,7 +444,7 @@ def render_dashboard() -> None:
 
     st.subheader("Price Forecasts")
     st.caption("ARIMA-based projections illustrate a plausible range for the next trading days.")
-    for ticker in selected_tickers:
+    for ticker in all_tickers:
         if ticker not in price_df.columns:
             continue
         series = price_df[ticker]
